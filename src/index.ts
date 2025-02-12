@@ -5,6 +5,8 @@ import sharp from "sharp";
 import { createClient } from '@supabase/supabase-js';
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import dotenv from 'dotenv';
+import { v4 as uuidv4 } from 'uuid';
+import os from 'os';
 
 // Load environment variables
 dotenv.config();
@@ -27,6 +29,8 @@ const s3Client = new S3Client({
 const BATCH_SIZE = 20;
 const MAX_IMAGES = 5;
 const BUCKET_NAME = process.env.AWS_S3_BUCKET_NAME!;
+const PROCESSING_TIMEOUT_MINUTES = 30; // Consider a place "stuck" if processing takes longer than this
+const WORKER_ID = `${os.hostname()}-${uuidv4()}`; // Unique ID for this worker/computer
 
 async function processImageLink(page: Page, link: ElementHandle): Promise<void> {
   await page.evaluate((element) => {
@@ -205,7 +209,70 @@ async function processImageGallery(page: Page, mapariId: string): Promise<string
   return imageUrls;
 }
 
-// Main function
+async function getPlaceBatch(): Promise<any[]> {
+  const now = new Date();
+  const timeoutThreshold = new Date(now.getTime() - (PROCESSING_TIMEOUT_MINUTES * 60 * 1000));
+
+  try {
+    // Start a transaction
+    const { data: lockedPlaces, error: lockError } = await supabase.rpc('lock_places_batch', {
+      worker_identifier: WORKER_ID,
+      batch_size: BATCH_SIZE,
+      timeout_threshold: timeoutThreshold.toISOString()
+    });
+
+    if (lockError) {
+      console.error('Error locking places:', lockError);
+      return [];
+    }
+
+    return lockedPlaces || [];
+
+  } catch (error) {
+    console.error('Error in getPlaceBatch:', error);
+    return [];
+  }
+}
+
+// Modified function to mark place as completed or release lock if failed
+async function updatePlaceStatus(mapariId: string, imageUrls: string[] | null, error: string | null = null) {
+  try {
+    if (imageUrls && imageUrls.length > 0) {
+      // Successfully processed
+      const { error: updateError } = await supabase
+        .from('google_places')
+        .update({
+          google_images: imageUrls.join(','),
+          processing_status: 'completed',
+          processing_worker: null,
+          processing_started_at: null,
+          last_processed_at: new Date().toISOString(),
+          processing_error: null
+        })
+        .eq('mapari_id', mapariId);
+
+      if (updateError) throw updateError;
+    } else {
+      // Failed or no images
+      const { error: updateError } = await supabase
+        .from('google_places')
+        .update({
+          processing_status: error ? 'failed' : 'pending',
+          processing_worker: null,
+          processing_started_at: null,
+          last_processed_at: new Date().toISOString(),
+          processing_error: error
+        })
+        .eq('mapari_id', mapariId);
+
+      if (updateError) throw updateError;
+    }
+  } catch (error) {
+    console.error(`Error updating status for place ${mapariId}:`, error);
+  }
+}
+
+// Modified main function
 async function main() {
   const browser = await puppeteer.launch({ headless: false });
   const page = await browser.newPage();
@@ -215,43 +282,28 @@ async function main() {
     let processedCount = 0;
     
     while (true) {
-      // Fetch batch of places from Supabase
-      const { data: places, error } = await supabase
-        .from('google_places')
-        .select('mapari_id, place_url')
-        .filter('google_images', 'is', null)
-        .limit(BATCH_SIZE);
-
-      if (error) {
-        throw error;
-      }
+      // Get batch of places with locking mechanism
+      const places = await getPlaceBatch();
 
       if (!places || places.length === 0) {
-        console.log("No more places to process");
-        break;
+        console.log("No places available to process, waiting before next attempt...");
+        await delay(10000); // Wait 10 seconds before trying again
+        continue;
       }
 
       console.log(`Processing batch of ${places.length} places...`);
 
       for (const place of places) {
-        const imageUrls = await processPlace(page, place.mapari_id, place.place_url);
-        
-        // Update Supabase with image URLs
-        if (imageUrls.length > 0) {
-          const { error: updateError } = await supabase
-            .from('google_places')
-            .update({ google_images: imageUrls.join(',') })
-            .eq('mapari_id', place.mapari_id);
-
-          if (updateError) {
-            console.error(`Error updating place ${place.mapari_id}:`, updateError);
-          } else {
-            console.log(`Updated place ${place.mapari_id} with ${imageUrls.length} images`);
-          }
+        try {
+          console.log(`Processing place ${place.mapari_id} with worker ${WORKER_ID}...`);
+          const imageUrls = await processPlace(page, place.mapari_id, place.place_url);
+          await updatePlaceStatus(place.mapari_id, imageUrls);
+          processedCount++;
+          console.log(`Successfully processed ${processedCount} places`);
+        } catch (error: any) {
+          console.error(`Error processing place ${place.mapari_id}:`, error);
+          await updatePlaceStatus(place.mapari_id, null, error.message);
         }
-
-        processedCount++;
-        console.log(`Processed ${processedCount} places`);
       }
 
       // Optional: Add delay between batches
@@ -263,7 +315,6 @@ async function main() {
     await browser.close();
   }
 }
-
 
 // Helper function to create a delay
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
